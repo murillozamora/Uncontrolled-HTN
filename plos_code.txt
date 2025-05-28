@@ -1,0 +1,179 @@
+
+# Install and load required packages  
+packages <- c("haven", "tidyverse", "glmnet", "ggplot2", "randomForest", "caret", "pROC", "boot", "dplyr")
+
+install_and_load <- function(p) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p, dependencies = TRUE)
+  library(p, character.only = TRUE)
+}
+
+invisible(lapply(packages, install_and_load))
+
+# Load the .dta file  
+file_path <- "C:/Users/efren.murilloza/OneDrive/ensanut/hipertension.dta"
+data <- read_dta(file_path)
+
+# Data preprocessing  
+data <- data %>%
+  mutate(across(c(sexo, lugar, a0301, plan_alimentacion, ejercicio_fisico, tiempo_diagnostico, nsef), as.factor))
+
+# Filter the target population  
+lasso_data <- data %>%
+  filter(a0401 == 1, edad >= 20)
+
+# Create predictor matrix and response vector  
+x <- model.matrix(has_descontrol ~ sexo + edad + lugar + a0301 + plan_alimentacion +
+                    ejercicio_fisico + tiempo_diagnostico + nsef, data = lasso_data)[, -1]
+y <- as.numeric(lasso_data$has_descontrol)
+
+# # # # # # # # # # # # # # # LASSO Regression Analysis # # # # # # # # # # # # # # #
+
+# Fit LASSO model with cross-validation  
+set.seed(123)
+lasso_model <- cv.glmnet(x, y, alpha = 1, family = "binomial")
+
+# Display results  
+cat("Optimal lambda:", lasso_model$lambda.min, "\n")
+print(coef(lasso_model, s = "lambda.min"))
+
+# Cross-validation curve  
+plot(lasso_model)
+abline(v = log(lasso_model$lambda.min), col = "red", lty = 2)
+
+# Extract model coefficients  
+coef_df <- as.data.frame(as.matrix(coef(lasso_model, s = "lambda.min")))
+coef_df$variable <- rownames(coef_df)
+colnames(coef_df)[1] <- "coefficient"
+coef_df <- coef_df[coef_df$coefficient != 0, ]
+
+# Dictionary for English variable names  
+english_names <- c(
+  "sexo1" = "Sex (cat. 1)", "edad" = "Age", "nsef2" = "Socioeconomic status (cat. 2)",
+  "nsef3" = "Socioeconomic status (cat. 3)", "a03011" = "Diabetes mellitus history (cat. 1)",
+  "plan_alimentacion1" = "Adherence to a nutritional plan", "lugar2" = "Source of medical care (cat. 2)",
+  "lugar3" = "Source of medical care (cat. 3)", "lugar4" = "Source of medical care (cat. 4)",
+  "tiempo_diagnostico2" = "Years since HTN diagnosis (cat. 2)", "tiempo_diagnostico3" = "Years since HTN diagnosis (cat. 3)"
+)
+
+coef_df <- coef_df[coef_df$variable != "(Intercept)", ]
+coef_df$variable <- english_names[coef_df$variable]
+coef_df <- coef_df[!is.na(coef_df$variable), ]
+
+# Generate bar plot of coefficients  
+ggplot(coef_df, aes(x = reorder(variable, coefficient), y = coefficient)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(x = "", y = "Coefficient Value") +
+  theme_minimal()
+
+# # # # # # # # # # # # # # # Random Forest Classification # # # # # # # # # # # # # # #
+
+# Train Random Forest model  
+rf_data <- data %>%
+  filter(a0401 == 1, edad >= 20) %>%
+  select(has_descontrol, sexo, edad, lugar, a0301, tiempo_diagnostico) %>%
+  mutate(across(c(has_descontrol, sexo, lugar, a0301, tiempo_diagnostico), as.factor))
+
+set.seed(123)
+rf_model <- randomForest(has_descontrol ~ sexo + edad + lugar + a0301 + tiempo_diagnostico,
+                          data = rf_data, ntree = 500, mtry = 3, importance = TRUE)
+
+# Display model results  
+print(rf_model)
+importance_vals <- importance(rf_model)
+print(round(importance_vals, 3))
+
+# Generate variable importance plot  
+importance_df <- as.data.frame(importance_vals)
+importance_df$Variable <- rownames(importance_df)
+importance_df$Variable <- english_names[importance_df$Variable]
+importance_df <- importance_df[!is.na(importance_df$Variable), ]
+
+ggplot(importance_df, aes(x = reorder(Variable, MeanDecreaseAccuracy), y = MeanDecreaseAccuracy)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(x = "", y = "%IncMSE") +
+  theme_minimal()
+
+# Evaluate model performance  
+predictions <- predict(rf_model, newdata = rf_data)
+conf_matrix <- confusionMatrix(predictions, rf_data$has_descontrol)
+print(conf_matrix)
+
+# Reproducibility info  
+sessionInfo()
+
+# # # # # # # # # # # # # # # XGBoost with SHAP # # # # # # # # # # # # # # #
+
+packages <- c("xgboost", "dplyr", "haven", "SHAPforxgboost", "ggplot2", "data.table")
+
+install_and_load <- function(p) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p, dependencies = TRUE)
+  library(p, character.only = TRUE)
+}
+
+invisible(lapply(packages, install_and_load))
+
+file_path <- "C:/Users/efren.murilloza/OneDrive/ensanut/hipertension.dta"
+data <- read_dta(file_path)
+
+data <- data %>%
+  mutate(across(c(sexo, lugar, a0301, plan_alimentacion, ejercicio_fisico, tiempo_diagnostico, nsef), as.factor))
+
+# Filter target population
+data_xgb <- data %>%
+  filter(a0401 == 1, edad >= 20)
+
+x <- model.matrix(has_descontrol ~ sexo + edad + lugar + a0301 + plan_alimentacion +
+                    ejercicio_fisico + tiempo_diagnostico + nsef, data = data_xgb)[, -1]
+y <- as.numeric(data_xgb$has_descontrol)
+
+
+# XGBoost model configuration
+
+set.seed(123)  # Ensures reproducibility
+dtrain <- xgb.DMatrix(data = as.matrix(x), label = y)  # Convert data to matrix format
+
+# Model hyperparameters
+params <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  max_depth = 6,
+  eta = 0.3
+)
+
+# Train the XGBoost model
+xgb_model <- xgb.train(params = params, data = dtrain, nrounds = 100)
+
+# Compute SHAP values
+X_train_matrix <- as.matrix(x)
+shap_values <- shap.prep(xgb_model = xgb_model, X_train = X_train_matrix)
+
+# Convert SHAP values to data.table format
+setDT(shap_values)
+
+variable_names <- c(
+  "sexo1" = "Sex (cat. 1)", "edad" = "Age", "nsef2" = "Socioeconomic status (cat. 2)",
+  "nsef3" = "Socioeconomic status (cat. 3)", "a03011" = "Diabetes mellitus history (cat. 1)",
+  "plan_alimentacion1" = "Adherence to a nutritional plan", "lugar2" = "Source of medical care (cat. 2)",
+  "lugar3" = "Source of medical care (cat. 3)", "lugar4" = "Source of medical care (cat. 4)",
+  "tiempo_diagnostico2" = "Years since HTN diagnosis (cat. 2)", "tiempo_diagnostico3" = "Years since HTN diagnosis (cat. 3)"
+)
+
+shap_values$variable <- ifelse(shap_values$variable %in% names(variable_names), 
+                               variable_names[shap_values$variable], shap_values$variable)
+
+shap_values$variable[is.na(shap_values$variable)] <- "Unnamed Variable"
+
+
+ggplot(shap_values, aes(x = reorder(variable, value, FUN = median), y = value, fill = abs(value))) +
+  geom_boxplot(alpha = 0.8, outlier.shape = NA) +
+  scale_fill_viridis_c(option = "C") +  
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "SHAP Values Importance",
+       x = "Feature",
+       y = "SHAP Value",
+       fill = "Absolute SHAP") +
+  theme(legend.position = "right", plot.title = element_text(hjust = 0.5, size = 14, face = "bold"))
+
